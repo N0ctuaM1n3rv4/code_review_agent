@@ -24,13 +24,13 @@ func (t *Trajectory) ToMessages(systemPrompt, initialUserMsg string) []llm.Messa
 			}
 			continue
 		}
-		msgs = append(msgs, llm.Message{Role: llm.RoleAssistant, Content: formatAssistantMsg(step.Thought, step.Action)})
+		msgs = append(msgs, llm.Message{Role: llm.RoleAssistant, Content: FormatAssistantMsg(step.Thought, step.Action)})
 		msgs = append(msgs, llm.Message{Role: llm.RoleUser, Content: fmt.Sprintf("Tool result for %s:\n%s", step.Action.Type, step.Observation)})
 	}
 	return msgs
 }
 
-func formatAssistantMsg(thought string, action Action) string {
+func FormatAssistantMsg(thought string, action Action) string {
 	callJSON, _ := json.Marshal(toolCallPayload{Name: action.Type, Arguments: action.Params})
 	var b strings.Builder
 	if thought != "" {

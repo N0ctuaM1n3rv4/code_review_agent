@@ -7,7 +7,6 @@ import (
 	"path/filepath"
 	"time"
 
-	"code-review-agent/internal/llm"
 	"code-review-agent/internal/tools"
 	"code-review-agent/internal/trajectory"
 )
@@ -16,7 +15,6 @@ type Session struct {
 	SavedAt    string               `json:"saved_at"`
 	Workspace  string               `json:"workspace"`
 	Skills     []string             `json:"skills,omitempty"`
-	Messages   []llm.Message        `json:"messages"`
 	Trajectory *trajectory.Trajectory `json:"trajectory,omitempty"`
 	Snapshot   tools.Snapshot       `json:"snapshot"`
 }
@@ -29,7 +27,6 @@ func (a *Agent) SaveSession(path string) error {
 		SavedAt:    time.Now().Format(time.RFC3339),
 		Workspace:  a.tools.Workspace(),
 		Skills:     a.prompts.LoadedSkillNames(),
-		Messages:   a.messages,
 		Trajectory: a.trajectory,
 		Snapshot:   a.tools.Snapshot(),
 	}
@@ -55,10 +52,14 @@ func (a *Agent) LoadSession(path string) error {
 		}
 	}
 	a.prompts.SetLoadedSkills(session.Skills)
-	a.messages = append([]llm.Message(nil), session.Messages...)
-	a.sanitizeMessages()
 	a.tools.RestoreSnapshot(session.Snapshot)
 	a.trajectory = session.Trajectory
+	a.lastCompressedIdx = 0
+	for i, step := range a.trajectory.Steps {
+		if step.FromSummary {
+			a.lastCompressedIdx = i
+		}
+	}
 	a.pendingEndAudit = false
 	return nil
 }

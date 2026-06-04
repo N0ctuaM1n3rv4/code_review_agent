@@ -17,13 +17,15 @@ import (
 )
 
 type Agent struct {
-	cfg             config.Config
-	prompts         prompt.Prompts
-	client          llm.Client
-	tools           *tools.Registry
-	messages        []llm.Message
-	trajectory      *trajectory.Trajectory
-	pendingEndAudit bool
+	cfg              config.Config
+	prompts          prompt.Prompts
+	client           llm.Client
+	tools            *tools.Registry
+	trajectory       *trajectory.Trajectory
+	initialUserMsg   string
+	compressUserMsgs []llm.Message
+	lastCompressedIdx int
+	pendingEndAudit  bool
 }
 
 type Event struct {
@@ -48,33 +50,36 @@ type ToolCall struct {
 }
 
 func New(cfg config.Config, prompts prompt.Prompts, client llm.Client, registry *tools.Registry) *Agent {
-	a := &Agent{cfg: cfg, prompts: prompts, client: client, tools: registry}
-	a.messages = []llm.Message{{Role: llm.RoleSystem, Content: a.systemPrompt()}}
-	return a
+	return &Agent{cfg: cfg, prompts: prompts, client: client, tools: registry}
 }
 
-func (a *Agent) sanitizeMessages() {
-	if len(a.messages) == 0 {
-		a.messages = []llm.Message{{Role: llm.RoleSystem, Content: a.systemPrompt()}}
-		return
+func (a *Agent) buildMessages() []llm.Message {
+	msgs := []llm.Message{{Role: llm.RoleSystem, Content: a.systemPrompt()}}
+	if a.initialUserMsg != "" {
+		msgs = append(msgs, llm.Message{Role: llm.RoleUser, Content: a.initialUserMsg})
 	}
-	var cleaned []llm.Message
-	hasSystem := false
-	for _, msg := range a.messages {
-		if msg.Role == llm.RoleSystem {
-			if hasSystem {
-				continue
-			}
-			hasSystem = true
+	if a.trajectory == nil {
+		return msgs
+	}
+	for i, step := range a.trajectory.Steps {
+		if i < a.lastCompressedIdx {
+			continue
 		}
-		cleaned = append(cleaned, msg)
+		if step.FromSummary {
+			msgs = append(msgs, llm.Message{Role: llm.RoleAssistant, Content: step.Observation})
+			continue
+		}
+		if step.Action.Type == "" {
+			if step.Observation != "" {
+				msgs = append(msgs, llm.Message{Role: llm.RoleUser, Content: step.Observation})
+			}
+			continue
+		}
+		msgs = append(msgs, llm.Message{Role: llm.RoleAssistant, Content: trajectory.FormatAssistantMsg(step.Thought, step.Action)})
+		msgs = append(msgs, llm.Message{Role: llm.RoleUser, Content: fmt.Sprintf("Tool result for %s:\n%s", step.Action.Type, step.Observation)})
 	}
-	if len(cleaned) == 0 || cleaned[0].Role != llm.RoleSystem {
-		cleaned = append([]llm.Message{{Role: llm.RoleSystem, Content: a.systemPrompt()}}, cleaned...)
-	} else {
-		cleaned[0] = llm.Message{Role: llm.RoleSystem, Content: a.systemPrompt()}
-	}
-	a.messages = cleaned
+	msgs = append(msgs, a.compressUserMsgs...)
+	return msgs
 }
 
 func (a *Agent) systemPrompt() string {
@@ -118,7 +123,6 @@ func (a *Agent) SetWorkspace(workspace string) error {
 	if err := a.tools.SetWorkspace(workspace); err != nil {
 		return err
 	}
-	a.sanitizeMessages()
 	return nil
 }
 
@@ -135,9 +139,8 @@ func (a *Agent) LoadedSkills() []string {
 }
 
 func (a *Agent) Run(ctx context.Context, input string, emit func(Event)) {
-	a.sanitizeMessages()
-	initialUserMsg := a.render("initial_audit_instruction", map[string]string{"input": input, "review_state": a.tools.ReviewPrompt(160)})
-	a.messages = append(a.messages, llm.Message{Role: llm.RoleUser, Content: initialUserMsg})
+	a.initialUserMsg = a.render("initial_audit_instruction", map[string]string{"input": input, "review_state": a.tools.ReviewPrompt(160)})
+	a.compressUserMsgs = nil
 	a.trajectory = trajectory.New(
 		fmt.Sprintf("audit-%d", time.Now().Unix()),
 		input,
@@ -177,14 +180,12 @@ func (a *Agent) Run(ctx context.Context, input string, emit func(Event)) {
 			a.trajectory.End()
 			return
 		}
-		a.messages = append(a.messages, llm.Message{Role: llm.RoleAssistant, Content: answer})
 		emit(Event{Kind: "assistant_done"})
 
 		thought, _, _, _ := trajectory.ParseAssistantMsg(answer)
 		call, ok := parseToolCall(answer)
 		if !ok {
 			retryMsg := a.render("no_tool_retry", nil)
-			a.messages = append(a.messages, llm.Message{Role: llm.RoleUser, Content: retryMsg})
 			a.trajectory.AddStep(thought, "", nil, retryMsg,
 				trajectory.WithAt(time.Now()),
 				trajectory.WithIsRetry(true))
@@ -192,12 +193,11 @@ func (a *Agent) Run(ctx context.Context, input string, emit func(Event)) {
 		}
 		if call.Name == "end_audit" {
 			if blocker := a.endAuditNeedsConfirmation(); blocker != "" {
-			emit(Event{Kind: "tool", Content: "end_audit 需要二次确认：仍有未完全审计文件"})
-			a.messages = append(a.messages, llm.Message{Role: llm.RoleUser, Content: blocker})
-			a.trajectory.AddStep(thought, "", nil, blocker,
-				trajectory.WithAt(time.Now()),
-				trajectory.WithIsRetry(true))
-			continue
+				emit(Event{Kind: "tool", Content: "end_audit 需要二次确认：仍有未完全审计文件"})
+				a.trajectory.AddStep(thought, "", nil, blocker,
+					trajectory.WithAt(time.Now()),
+					trajectory.WithIsRetry(true))
+				continue
 			}
 			emit(Event{Kind: "tool", Content: "AI 调用了审计完成工具 end_audit"})
 		} else {
@@ -207,7 +207,6 @@ func (a *Agent) Run(ctx context.Context, input string, emit func(Event)) {
 		startTime := time.Now()
 		result := a.callTool(ctx, emit, call)
 		latency := time.Since(startTime)
-		a.messages = append(a.messages, llm.Message{Role: llm.RoleUser, Content: "Tool result for " + call.Name + ":\n" + result})
 		a.trajectory.AddStep(thought, call.Name, call.Arguments, result,
 			trajectory.WithAt(startTime),
 			trajectory.WithLatency(latency.Truncate(time.Millisecond).String()))
@@ -291,7 +290,6 @@ func (a *Agent) verifyFinding(ctx context.Context, emit func(Event), raw json.Ra
 	childPrompts := a.prompts
 	childPrompts.SetLoadedSkills(a.prompts.LoadedSkillNames())
 	child := &Agent{cfg: a.cfg, prompts: childPrompts, client: a.client, tools: registry}
-	child.messages = []llm.Message{{Role: llm.RoleSystem, Content: child.systemPrompt()}}
 	if emit != nil {
 		emit(Event{Kind: "verify_progress", VerifyTitle: args.Title, VerifyTurn: 0, VerifyLimit: child.verificationTurnLimit(), VerifyStatus: "准备验证"})
 	}
@@ -332,6 +330,7 @@ func (a *Agent) runVerification(ctx context.Context, emit func(Event), args veri
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	messages := []llm.Message{{Role: llm.RoleSystem, Content: a.systemPrompt()}}
 	verifyPrompt := a.render("verify_finding", map[string]string{
 		"title":          args.Title,
 		"severity":       args.Severity,
@@ -343,17 +342,20 @@ func (a *Agent) runVerification(ctx context.Context, emit func(Event), args veri
 		"cwe":            args.CWE,
 		"review_state":   a.tools.ReviewPrompt(200),
 	})
-	a.messages = append(a.messages, llm.Message{Role: llm.RoleUser, Content: verifyPrompt})
+	messages = append(messages, llm.Message{Role: llm.RoleUser, Content: verifyPrompt})
 	maxTurns := a.verificationTurnLimit()
 	for turn := 1; turn <= maxTurns; turn++ {
 		if emit != nil {
 			emit(Event{Kind: "verify_progress", VerifyTitle: args.Title, VerifyTurn: turn, VerifyLimit: maxTurns, VerifyStatus: "等待子 agent 响应"})
 		}
-		answer, err := a.chatStream(ctx, func(Event) {})
+		answer, err := a.chatWithRetry(ctx, messages, func(Event) {})
 		if err != nil {
 			return "", err
 		}
-		a.messages = append(a.messages, llm.Message{Role: llm.RoleAssistant, Content: answer})
+		parser := newThinkParser(func(Event) {})
+		parser.Write(answer)
+		parser.Flush()
+		messages = append(messages, llm.Message{Role: llm.RoleAssistant, Content: answer})
 		call, ok := parseToolCall(answer)
 		if !ok {
 			if emit != nil {
@@ -365,27 +367,27 @@ func (a *Agent) runVerification(ctx context.Context, emit func(Event), args veri
 			emit(Event{Kind: "verify_progress", VerifyTitle: args.Title, VerifyTurn: turn, VerifyLimit: maxTurns, VerifyStatus: describeVerificationToolCall(call)})
 		}
 		if call.Name == "verify_finding" || call.Name == "report_finding" || call.Name == "end_audit" || call.Name == "load_skill" {
-			a.messages = append(a.messages, llm.Message{Role: llm.RoleUser, Content: "验证子 agent 禁止调用该工具。请继续读取代码并在最后直接输出验证结论，不要再调用工具。"})
+			messages = append(messages, llm.Message{Role: llm.RoleUser, Content: "验证子 agent 禁止调用该工具。请继续读取代码并在最后直接输出验证结论，不要再调用工具。"})
 			if emit != nil {
 				emit(Event{Kind: "verify_progress", VerifyTitle: args.Title, VerifyTurn: turn, VerifyLimit: maxTurns, VerifyStatus: "工具不允许，要求直接总结"})
 			}
 			continue
 		}
 		result := a.tools.Call(call.Name, call.Arguments)
-		a.messages = append(a.messages, llm.Message{Role: llm.RoleUser, Content: "Tool result for " + call.Name + ":\n" + result})
+		messages = append(messages, llm.Message{Role: llm.RoleUser, Content: "Tool result for " + call.Name + ":\n" + result})
 	}
 	if emit != nil {
 		emit(Event{Kind: "verify_progress", VerifyTitle: args.Title, VerifyTurn: maxTurns, VerifyLimit: maxTurns, VerifyStatus: "达到上限，强制总结"})
 	}
-	a.messages = append(a.messages, llm.Message{Role: llm.RoleUser, Content: "已经达到验证轮数上限。现在禁止继续调用工具，请立刻基于已有证据输出最终中文验证结论，按约定格式总结是否成立、是否建议提交、原因、利用链复核、关键证据和仍需补充。"})
+	messages = append(messages, llm.Message{Role: llm.RoleUser, Content: "已经达到验证轮数上限。现在禁止继续调用工具，请立刻基于已有证据输出最终中文验证结论，按约定格式总结是否成立、是否建议提交、原因、利用链复核、关键证据和仍需补充。"})
 	if emit != nil {
 		emit(Event{Kind: "verify_progress", VerifyTitle: args.Title, VerifyTurn: maxTurns, VerifyLimit: maxTurns, VerifyStatus: "达到上限，正在强制总结"})
 	}
-	answer, err := a.chatStream(ctx, func(Event) {})
+	answer, err := a.chatWithRetry(ctx, messages, func(Event) {})
 	if err != nil {
 		return "", err
 	}
-	a.messages = append(a.messages, llm.Message{Role: llm.RoleAssistant, Content: answer})
+	messages = append(messages, llm.Message{Role: llm.RoleAssistant, Content: answer})
 	return answer, nil
 }
 
@@ -554,9 +556,8 @@ func (a *Agent) formatFinalFindings() string {
 }
 
 func (a *Agent) chatStream(ctx context.Context, emit func(Event)) (string, error) {
-	a.sanitizeMessages()
 	if !a.cfg.OpenAI.Stream {
-		return a.chatStreamOnce(ctx, emit)
+		return a.chatStreamOnce(ctx, emit, a.buildMessages())
 	}
 	attempts := a.retryAttempts()
 	var lastErr error
@@ -564,7 +565,7 @@ func (a *Agent) chatStream(ctx context.Context, emit func(Event)) (string, error
 		if attempt > 0 {
 			emit(Event{Kind: "info", Content: fmt.Sprintf("开始第 %d/%d 次模型重试请求。", attempt+1, attempts+1)})
 		}
-		answer, err := a.chatStreamOnce(ctx, emit)
+		answer, err := a.chatStreamOnce(ctx, emit, a.buildMessages())
 		if err == nil {
 			return answer, nil
 		}
@@ -579,12 +580,12 @@ func (a *Agent) chatStream(ctx context.Context, emit func(Event)) (string, error
 	return "", lastErr
 }
 
-func (a *Agent) chatStreamOnce(ctx context.Context, emit func(Event)) (string, error) {
+func (a *Agent) chatStreamOnce(ctx context.Context, emit func(Event), messages []llm.Message) (string, error) {
 	if ctx.Err() != nil {
 		return "", ctx.Err()
 	}
 	if !a.cfg.OpenAI.Stream {
-		answer, err := a.chatWithRetry(ctx, a.messages, emit)
+		answer, err := a.chatWithRetry(ctx, messages, emit)
 		if err != nil {
 			return "", err
 		}
@@ -610,7 +611,7 @@ func (a *Agent) chatStreamOnce(ctx context.Context, emit func(Event)) (string, e
 		}
 		lastFlush = time.Now()
 	}
-	err := a.client.ChatStream(ctx, a.messages, func(delta llm.Delta) error {
+	err := a.client.ChatStream(ctx, messages, func(delta llm.Delta) error {
 		if ctx.Err() != nil {
 			return ctx.Err()
 		}
@@ -681,7 +682,7 @@ func (a *Agent) retryAttempts() int {
 
 func (a *Agent) compressIfNeeded(ctx context.Context, emit func(Event)) error {
 	limit := a.compressionLimit()
-	if limit <= 0 || estimateTokens(a.messages) < limit {
+	if limit <= 0 || estimateTokens(a.buildMessages()) < limit {
 		return nil
 	}
 	return a.compressContext(ctx, emit, "context budget reached")
@@ -701,7 +702,6 @@ func (a *Agent) compressionLimit() int {
 }
 
 func (a *Agent) compressContext(ctx context.Context, emit func(Event), reason string) error {
-	a.sanitizeMessages()
 	emit(Event{Kind: "tool", Content: "compressing context: " + reason})
 	var b strings.Builder
 	b.WriteString("Compression reason: ")
@@ -711,7 +711,8 @@ func (a *Agent) compressContext(ctx context.Context, emit func(Event), reason st
 	b.WriteString("\n")
 	b.WriteString(a.statePrompt(200))
 	b.WriteString("\nConversation to compress:\n")
-	for _, msg := range a.messages[1:] {
+	currMsgs := a.buildMessages()
+	for _, msg := range currMsgs[1:] {
 		b.WriteString(string(msg.Role))
 		b.WriteString(":\n")
 		b.WriteString(msg.Content)
@@ -724,17 +725,14 @@ func (a *Agent) compressContext(ctx context.Context, emit func(Event), reason st
 	if err != nil {
 		return err
 	}
-	a.messages = []llm.Message{
-		{Role: llm.RoleSystem, Content: a.systemPrompt()},
-		{Role: llm.RoleAssistant, Content: "Compressed audit context:\n" + compressed},
+	a.lastCompressedIdx = len(a.trajectory.Steps)
+	a.trajectory.AddStep("", "", nil,
+		"Compressed audit context:\n"+compressed,
+		trajectory.WithAt(time.Now()),
+		trajectory.WithFromSummary(true))
+	a.compressUserMsgs = []llm.Message{
 		{Role: llm.RoleUser, Content: a.render("state_after_compress", map[string]string{"state": a.statePrompt(240)})},
 		{Role: llm.RoleUser, Content: a.render("resume_after_compress", map[string]string{"summary_interval": fmt.Sprint(a.cfg.Agent.SummaryInterval)})},
-	}
-	if a.trajectory != nil {
-		a.trajectory.AddStep("", "", nil,
-			"Compressed audit context:\n"+compressed,
-			trajectory.WithAt(time.Now()),
-			trajectory.WithFromSummary(true))
 	}
 	emit(Event{Kind: "ui_compact", Content: "## 上下文已压缩\n\n" + compressed})
 	a.emitState(emit)
