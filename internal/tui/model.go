@@ -20,6 +20,7 @@ import (
 
 	"code-review-agent/internal/agent"
 	"code-review-agent/internal/tools"
+	"code-review-agent/internal/trajectory"
 )
 
 type Model struct {
@@ -248,6 +249,8 @@ func (m Model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					return m.restoreSession(arg)
 				case "sessions":
 					return m.listSessions()
+				case "trajectory":
+					return m.showTrajectory()
 				case "pet-preview":
 					m.toggleFindingPetPreview()
 					return m, nil
@@ -505,7 +508,7 @@ func (m *Model) completeCommand() (string, bool) {
 }
 
 func (m *Model) commandNames() []string {
-	return []string{"go", "list", "export", "files", "save", "restore", "sessions", "pet-preview"}
+	return []string{"go", "list", "export", "files", "save", "restore", "sessions", "trajectory", "pet-preview"}
 }
 
 func (m Model) commandMatches() []string {
@@ -598,6 +601,8 @@ func commandDescription(command string) string {
 		return "restore session file"
 	case "/sessions":
 		return "list saved sessions"
+	case "/trajectory":
+		return "show ReAct trajectory steps"
 	case "/pet-preview":
 		return "toggle finding pet preview"
 	default:
@@ -696,14 +701,15 @@ func (m Model) cancelAudit() (tea.Model, tea.Cmd) {
 func (m Model) exportReport() (tea.Model, tea.Cmd) {
 	filesReviewed, filesUnreviewed := splitFilesForReport(m.files)
 	report := struct {
-		GeneratedAt string                 `json:"generated_at"`
-		Audit       tools.AuditState       `json:"audit"`
-		Count       int                    `json:"count"`
-		Findings    []tools.Finding        `json:"findings"`
-		Todos       []tools.Todo           `json:"todos"`
-		Files       reportFiles            `json:"files"`
-		Variables   []tools.VariableReview `json:"variables"`
-		Flows       []tools.FlowReview     `json:"flows"`
+		GeneratedAt string                   `json:"generated_at"`
+		Audit       tools.AuditState         `json:"audit"`
+		Count       int                      `json:"count"`
+		Findings    []tools.Finding          `json:"findings"`
+		Todos       []tools.Todo             `json:"todos"`
+		Files       reportFiles              `json:"files"`
+		Variables   []tools.VariableReview   `json:"variables"`
+		Flows       []tools.FlowReview       `json:"flows"`
+		Trajectory  *trajectory.Trajectory   `json:"trajectory,omitempty"`
 	}{
 		GeneratedAt: time.Now().Format(time.RFC3339),
 		Audit:       m.audit,
@@ -713,6 +719,7 @@ func (m Model) exportReport() (tea.Model, tea.Cmd) {
 		Files:       reportFiles{Reviewed: filesReviewed, Unreviewed: filesUnreviewed},
 		Variables:   m.variables,
 		Flows:       m.flows,
+		Trajectory:  m.runner.Trajectory(),
 	}
 	data, err := json.MarshalIndent(report, "", "  ")
 	if err != nil {
@@ -724,6 +731,66 @@ func (m Model) exportReport() (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	m.log = append(m.log, logEntry{Kind: "info", Content: fmt.Sprintf("已导出 %d 个漏洞到当前目录 report.json", len(m.findings))})
+	m.trimLog()
+	return m, nil
+}
+
+func (m Model) showTrajectory() (tea.Model, tea.Cmd) {
+	trj := m.runner.Trajectory()
+	if trj == nil || len(trj.Steps) == 0 {
+		m.log = append(m.log, logEntry{Kind: "info", Content: "暂无轨迹数据。请先运行一次审计。"})
+		m.trimLog()
+		return m, nil
+	}
+	var b strings.Builder
+	b.WriteString(fmt.Sprintf("## ReAct Trajectory (%s)\n\n", trj.ID))
+	b.WriteString(fmt.Sprintf("模型：%s\n", trj.Model))
+	b.WriteString(fmt.Sprintf("工作区：`%s`\n", trj.Workspace))
+	b.WriteString(fmt.Sprintf("指令：%s\n", truncateRunes(trj.Instruction, 120)))
+	b.WriteString(fmt.Sprintf("步骤数：%d\n", len(trj.Steps)))
+	if !trj.EndedAt.IsZero() {
+		b.WriteString(fmt.Sprintf("耗时：%s\n\n", trj.EndedAt.Sub(trj.StartedAt).Truncate(time.Second)))
+	}
+	b.WriteString("\n| # | Role | Action | Latency |\n|--|------|--------|---------|\n")
+	for _, step := range trj.Steps {
+		role := "thought"
+		action := "-"
+		latency := "-"
+		if step.Action.Type != "" {
+			role = "action"
+			action = step.Action.Type
+			if step.Latency != "" {
+				latency = step.Latency
+			}
+		} else if step.FromSummary {
+			role = "summary"
+		}
+		if step.IsRetry {
+			role = "retry"
+		}
+		b.WriteString(fmt.Sprintf("| %d | %s | %s | %s |\n", step.Step, role, action, latency))
+	}
+	b.WriteString("\n### 详细步骤\n")
+	for _, step := range trj.Steps {
+		b.WriteString(fmt.Sprintf("\n#### Step %d\n", step.Step))
+		b.WriteString(fmt.Sprintf("- **时间**: %s\n", step.At.Format("15:04:05.000")))
+		if step.Latency != "" {
+			b.WriteString(fmt.Sprintf("- **耗时**: %s\n", step.Latency))
+		}
+		if step.Thought != "" {
+			b.WriteString(fmt.Sprintf("- **思考**: %s\n", truncateRunes(step.Thought, 200)))
+		}
+		if step.Action.Type != "" {
+			b.WriteString(fmt.Sprintf("- **行动**: `%s`\n", step.Action.Type))
+			if len(step.Action.Params) > 0 {
+				b.WriteString(fmt.Sprintf("  ```json\n  %s\n  ```\n", truncateRunes(string(step.Action.Params), 300)))
+			}
+		}
+		if step.Observation != "" && !step.FromSummary {
+			b.WriteString(fmt.Sprintf("- **观察**: %s\n", truncateRunes(step.Observation, 200)))
+		}
+	}
+	m.log = append(m.log, logEntry{Kind: "assistant", Content: b.String()})
 	m.trimLog()
 	return m, nil
 }

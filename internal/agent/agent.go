@@ -13,6 +13,7 @@ import (
 	"code-review-agent/internal/llm"
 	"code-review-agent/internal/prompt"
 	"code-review-agent/internal/tools"
+	"code-review-agent/internal/trajectory"
 )
 
 type Agent struct {
@@ -21,6 +22,7 @@ type Agent struct {
 	client          llm.Client
 	tools           *tools.Registry
 	messages        []llm.Message
+	trajectory      *trajectory.Trajectory
 	pendingEndAudit bool
 }
 
@@ -124,64 +126,95 @@ func (a *Agent) Snapshot() tools.Snapshot {
 	return a.tools.Snapshot()
 }
 
+func (a *Agent) Trajectory() *trajectory.Trajectory {
+	return a.trajectory
+}
+
 func (a *Agent) LoadedSkills() []string {
 	return a.prompts.LoadedSkillNames()
 }
 
 func (a *Agent) Run(ctx context.Context, input string, emit func(Event)) {
 	a.sanitizeMessages()
-	a.messages = append(a.messages, llm.Message{Role: llm.RoleUser, Content: a.render("initial_audit_instruction", map[string]string{"input": input, "review_state": a.tools.ReviewPrompt(160)})})
+	initialUserMsg := a.render("initial_audit_instruction", map[string]string{"input": input, "review_state": a.tools.ReviewPrompt(160)})
+	a.messages = append(a.messages, llm.Message{Role: llm.RoleUser, Content: initialUserMsg})
+	a.trajectory = trajectory.New(
+		fmt.Sprintf("audit-%d", time.Now().Unix()),
+		input,
+		a.cfg.OpenAI.Model,
+		a.tools.Workspace(),
+	)
 	a.emitState(emit)
 	for turn := 1; ; turn++ {
 		if ctx.Err() != nil {
+			a.trajectory.End()
 			return
 		}
 		if a.cfg.Agent.MaxTurns > 0 && turn > a.cfg.Agent.MaxTurns {
 			emit(Event{Kind: "error", Content: "max agent turns reached"})
+			a.trajectory.End()
 			return
 		}
 		if a.cfg.Agent.SummaryInterval > 0 && turn > 1 && (turn-1)%a.cfg.Agent.SummaryInterval == 0 {
 			if err := a.compressContext(ctx, emit, fmt.Sprintf("%d agent turns completed", a.cfg.Agent.SummaryInterval)); err != nil {
 				emit(Event{Kind: "error", Content: err.Error()})
+				a.trajectory.End()
 				return
 			}
 		}
 		if err := a.compressIfNeeded(ctx, emit); err != nil {
 			emit(Event{Kind: "error", Content: err.Error()})
+			a.trajectory.End()
 			return
 		}
 		answer, err := a.chatStream(ctx, emit)
 		if err != nil {
 			if errors.Is(err, context.Canceled) {
+				a.trajectory.End()
 				return
 			}
 			emit(Event{Kind: "error", Content: err.Error()})
+			a.trajectory.End()
 			return
 		}
 		a.messages = append(a.messages, llm.Message{Role: llm.RoleAssistant, Content: answer})
 		emit(Event{Kind: "assistant_done"})
 
+		thought, _, _, _ := trajectory.ParseAssistantMsg(answer)
 		call, ok := parseToolCall(answer)
 		if !ok {
-			a.messages = append(a.messages, llm.Message{Role: llm.RoleUser, Content: a.render("no_tool_retry", nil)})
+			retryMsg := a.render("no_tool_retry", nil)
+			a.messages = append(a.messages, llm.Message{Role: llm.RoleUser, Content: retryMsg})
+			a.trajectory.AddStep(thought, "", nil, retryMsg,
+				trajectory.WithAt(time.Now()),
+				trajectory.WithIsRetry(true))
 			continue
 		}
 		if call.Name == "end_audit" {
 			if blocker := a.endAuditNeedsConfirmation(); blocker != "" {
-				emit(Event{Kind: "tool", Content: "end_audit 需要二次确认：仍有未完全审计文件"})
-				a.messages = append(a.messages, llm.Message{Role: llm.RoleUser, Content: blocker})
-				continue
+			emit(Event{Kind: "tool", Content: "end_audit 需要二次确认：仍有未完全审计文件"})
+			a.messages = append(a.messages, llm.Message{Role: llm.RoleUser, Content: blocker})
+			a.trajectory.AddStep(thought, "", nil, blocker,
+				trajectory.WithAt(time.Now()),
+				trajectory.WithIsRetry(true))
+			continue
 			}
 			emit(Event{Kind: "tool", Content: "AI 调用了审计完成工具 end_audit"})
 		} else {
 			a.pendingEndAudit = false
 			emit(Event{Kind: "tool", Content: fmt.Sprintf("calling %s", call.Name)})
 		}
+		startTime := time.Now()
 		result := a.callTool(ctx, emit, call)
+		latency := time.Since(startTime)
 		a.messages = append(a.messages, llm.Message{Role: llm.RoleUser, Content: "Tool result for " + call.Name + ":\n" + result})
+		a.trajectory.AddStep(thought, call.Name, call.Arguments, result,
+			trajectory.WithAt(startTime),
+			trajectory.WithLatency(latency.Truncate(time.Millisecond).String()))
 		emit(Event{Kind: "tool", Content: a.displayToolResult(call.Name, result)})
 		a.emitState(emit)
 		if tools.IsTerminalTool(call.Name) {
+			a.trajectory.End()
 			emit(Event{Kind: "assistant", Content: "## 审计已完成\n\n" + formatEndAuditResult(result)})
 			return
 		}
@@ -696,6 +729,12 @@ func (a *Agent) compressContext(ctx context.Context, emit func(Event), reason st
 		{Role: llm.RoleAssistant, Content: "Compressed audit context:\n" + compressed},
 		{Role: llm.RoleUser, Content: a.render("state_after_compress", map[string]string{"state": a.statePrompt(240)})},
 		{Role: llm.RoleUser, Content: a.render("resume_after_compress", map[string]string{"summary_interval": fmt.Sprint(a.cfg.Agent.SummaryInterval)})},
+	}
+	if a.trajectory != nil {
+		a.trajectory.AddStep("", "", nil,
+			"Compressed audit context:\n"+compressed,
+			trajectory.WithAt(time.Now()),
+			trajectory.WithFromSummary(true))
 	}
 	emit(Event{Kind: "ui_compact", Content: "## 上下文已压缩\n\n" + compressed})
 	a.emitState(emit)

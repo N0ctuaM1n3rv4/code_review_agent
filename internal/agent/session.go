@@ -9,14 +9,16 @@ import (
 
 	"code-review-agent/internal/llm"
 	"code-review-agent/internal/tools"
+	"code-review-agent/internal/trajectory"
 )
 
 type Session struct {
-	SavedAt   string         `json:"saved_at"`
-	Workspace string         `json:"workspace"`
-	Skills    []string       `json:"skills,omitempty"`
-	Messages  []llm.Message  `json:"messages"`
-	Snapshot  tools.Snapshot `json:"snapshot"`
+	SavedAt    string               `json:"saved_at"`
+	Workspace  string               `json:"workspace"`
+	Skills     []string             `json:"skills,omitempty"`
+	Messages   []llm.Message        `json:"messages"`
+	Trajectory *trajectory.Trajectory `json:"trajectory,omitempty"`
+	Snapshot   tools.Snapshot       `json:"snapshot"`
 }
 
 func (a *Agent) SaveSession(path string) error {
@@ -24,11 +26,12 @@ func (a *Agent) SaveSession(path string) error {
 		return err
 	}
 	session := Session{
-		SavedAt:   time.Now().Format(time.RFC3339),
-		Workspace: a.tools.Workspace(),
-		Skills:    a.prompts.LoadedSkillNames(),
-		Messages:  a.messages,
-		Snapshot:  a.tools.Snapshot(),
+		SavedAt:    time.Now().Format(time.RFC3339),
+		Workspace:  a.tools.Workspace(),
+		Skills:     a.prompts.LoadedSkillNames(),
+		Messages:   a.messages,
+		Trajectory: a.trajectory,
+		Snapshot:   a.tools.Snapshot(),
 	}
 	data, err := json.MarshalIndent(session, "", "  ")
 	if err != nil {
@@ -55,6 +58,7 @@ func (a *Agent) LoadSession(path string) error {
 	a.messages = append([]llm.Message(nil), session.Messages...)
 	a.sanitizeMessages()
 	a.tools.RestoreSnapshot(session.Snapshot)
+	a.trajectory = session.Trajectory
 	a.pendingEndAudit = false
 	return nil
 }
