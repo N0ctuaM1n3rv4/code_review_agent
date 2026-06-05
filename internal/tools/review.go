@@ -2,6 +2,7 @@ package tools
 
 import (
 	"encoding/json"
+	"fmt"
 	pathpkg "path"
 	"strings"
 )
@@ -81,6 +82,9 @@ func (r *Registry) fileReviewUpdate(raw json.RawMessage) Result {
 	}
 	if args.Status == "" {
 		args.Status = "reviewed"
+	}
+	if err := validateFileReviewStatus(args.Status); err != nil {
+		return Result{OK: false, Error: err.Error()}
 	}
 	for i := range r.files {
 		if r.files[i].Path == args.Path {
@@ -260,6 +264,9 @@ func (r *Registry) fileReviewUpdateBatch(items []fileReviewUpdateItem) Result {
 		if item.Status == "" {
 			item.Status = "reviewed"
 		}
+		if err := validateFileReviewStatus(item.Status); err != nil {
+			return Result{OK: false, Error: err.Error()}
+		}
 		updated := false
 		for i := range r.files {
 			if r.files[i].Path == item.Path {
@@ -289,6 +296,15 @@ func appendFileReviewSample(sample []FileReview, item FileReview) []FileReview {
 		return sample
 	}
 	return append(sample, item)
+}
+
+func validateFileReviewStatus(status string) error {
+	switch strings.TrimSpace(status) {
+	case "unseen", "reviewing", "reviewed", "skipped":
+		return nil
+	default:
+		return fmt.Errorf("invalid file review status: %s", status)
+	}
 }
 
 func (r *Registry) variableReviewUpdate(raw json.RawMessage) Result {

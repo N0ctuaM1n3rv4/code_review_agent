@@ -44,6 +44,16 @@ type Snapshot struct {
 	Audit     AuditState       `json:"audit"`
 }
 
+type IncompleteWork struct {
+	Files         []FileReview
+	Todos         []Todo
+	Variables     []VariableReview
+	Flows         []FlowReview
+	UnknownFiles  []FileReview
+	ActiveFiles   []FileReview
+	BlockingFiles []FileReview
+}
+
 func (r *Registry) RestoreSnapshot(snapshot Snapshot) {
 	r.todos = append([]Todo(nil), snapshot.Todos...)
 	r.findings = append([]Finding(nil), snapshot.Findings...)
@@ -191,6 +201,42 @@ func (r *Registry) Snapshot() Snapshot {
 
 func (r *Registry) Audit() AuditState {
 	return r.audit
+}
+
+func (r *Registry) IncompleteWork() IncompleteWork {
+	work := IncompleteWork{}
+	for _, todo := range r.todos {
+		switch strings.TrimSpace(strings.ToLower(todo.Status)) {
+		case "", "pending", "reviewing", "tracking", "todo", "open":
+			work.Todos = append(work.Todos, todo)
+		}
+	}
+	for _, file := range r.files {
+		switch strings.TrimSpace(strings.ToLower(file.Status)) {
+		case "unseen", "reviewing":
+			work.Files = append(work.Files, file)
+			work.ActiveFiles = append(work.ActiveFiles, file)
+			work.BlockingFiles = append(work.BlockingFiles, file)
+		case "reviewed", "skipped":
+		default:
+			work.Files = append(work.Files, file)
+			work.UnknownFiles = append(work.UnknownFiles, file)
+			work.BlockingFiles = append(work.BlockingFiles, file)
+		}
+	}
+	for _, variable := range r.variables {
+		switch strings.TrimSpace(strings.ToLower(variable.Status)) {
+		case "tracking", "suspicious", "pending", "":
+			work.Variables = append(work.Variables, variable)
+		}
+	}
+	for _, flow := range r.flows {
+		switch strings.TrimSpace(strings.ToLower(flow.Status)) {
+		case "tracking", "suspicious", "pending", "":
+			work.Flows = append(work.Flows, flow)
+		}
+	}
+	return work
 }
 
 func (r *Registry) ToolPrompt() string {

@@ -12,11 +12,11 @@ import (
 )
 
 type Session struct {
-	SavedAt    string               `json:"saved_at"`
-	Workspace  string               `json:"workspace"`
-	Skills     []string             `json:"skills,omitempty"`
+	SavedAt    string                 `json:"saved_at"`
+	Workspace  string                 `json:"workspace"`
+	Skills     []string               `json:"skills,omitempty"`
 	Trajectory *trajectory.Trajectory `json:"trajectory,omitempty"`
-	Snapshot   tools.Snapshot       `json:"snapshot"`
+	Snapshot   tools.Snapshot         `json:"snapshot"`
 }
 
 func (a *Agent) SaveSession(path string) error {
@@ -55,9 +55,11 @@ func (a *Agent) LoadSession(path string) error {
 	a.tools.RestoreSnapshot(session.Snapshot)
 	a.trajectory = session.Trajectory
 	a.lastCompressedIdx = 0
-	for i, step := range a.trajectory.Steps {
-		if step.FromSummary {
-			a.lastCompressedIdx = i
+	if a.trajectory != nil {
+		for i, step := range a.trajectory.Steps {
+			if step.FromSummary {
+				a.lastCompressedIdx = i
+			}
 		}
 	}
 	a.pendingEndAudit = false

@@ -17,15 +17,27 @@ import (
 )
 
 type Agent struct {
-	cfg              config.Config
-	prompts          prompt.Prompts
-	client           llm.Client
-	tools            *tools.Registry
-	trajectory       *trajectory.Trajectory
-	initialUserMsg   string
-	compressUserMsgs []llm.Message
+	cfg               config.Config
+	prompts           prompt.Prompts
+	client            llm.Client
+	tools             *tools.Registry
+	trajectory        *trajectory.Trajectory
+	initialUserMsg    string
+	compressUserMsgs  []llm.Message
 	lastCompressedIdx int
-	pendingEndAudit  bool
+	pendingEndAudit   bool
+}
+
+type endAuditCheck struct {
+	Allow          bool
+	NeedsConfirm   bool
+	ConfirmReason  string
+	BlockingReason string
+}
+
+type endAuditToolArgs struct {
+	Summary   string `json:"summary"`
+	NextSteps string `json:"next_steps"`
 }
 
 type Event struct {
@@ -192,8 +204,17 @@ func (a *Agent) Run(ctx context.Context, input string, emit func(Event)) {
 			continue
 		}
 		if call.Name == "end_audit" {
-			if blocker := a.endAuditNeedsConfirmation(); blocker != "" {
-				emit(Event{Kind: "tool", Content: "end_audit 需要二次确认：仍有未完全审计文件"})
+			check := a.endAuditCheck(call.Arguments)
+			if !check.Allow {
+				label := "end_audit 被阻止：仍有未完成审计工作"
+				if check.NeedsConfirm {
+					label = "end_audit 需要二次确认：仍有未完全审计文件"
+				}
+				emit(Event{Kind: "tool", Content: label})
+				blocker := check.BlockingReason
+				if check.NeedsConfirm {
+					blocker = check.ConfirmReason
+				}
 				a.trajectory.AddStep(thought, "", nil, blocker,
 					trajectory.WithAt(time.Now()),
 					trajectory.WithIsRetry(true))
@@ -452,26 +473,139 @@ func (a *Agent) verificationTurnLimit() int {
 	return 8
 }
 
-func (a *Agent) endAuditNeedsConfirmation() string {
-	var files []string
-	for _, file := range a.tools.Files() {
-		if file.Status == "unseen" || file.Status == "reviewing" {
-			files = append(files, fmt.Sprintf("- [%s] %s", file.Status, file.Path))
-		}
-	}
-	if len(files) == 0 {
+func (a *Agent) endAuditCheck(raw json.RawMessage) endAuditCheck {
+	work := a.tools.IncompleteWork()
+	args := decodeEndAuditArgs(raw)
+	if len(work.Todos) == 0 && len(work.Flows) == 0 && len(work.Variables) == 0 && len(work.BlockingFiles) == 0 && !summaryContradictsEndAudit(args.NextSteps) {
 		a.pendingEndAudit = false
-		return ""
+		return endAuditCheck{Allow: true}
+	}
+	if len(work.Todos) > 0 || len(work.Flows) > 0 || len(work.Variables) > 0 || len(work.UnknownFiles) > 0 || summaryContradictsEndAudit(args.NextSteps) {
+		a.pendingEndAudit = false
+		return endAuditCheck{Allow: false, BlockingReason: a.renderEndAuditBlocker(work, args.NextSteps)}
+	}
+	if len(work.ActiveFiles) == 0 {
+		a.pendingEndAudit = false
+		return endAuditCheck{Allow: true}
 	}
 	if a.pendingEndAudit {
 		a.pendingEndAudit = false
-		return ""
+		return endAuditCheck{Allow: true}
 	}
 	a.pendingEndAudit = true
-	if len(files) > 80 {
-		files = append(files[:80], fmt.Sprintf("- ...还有 %d 个文件未列出", len(files)-80))
-	}
+	return endAuditCheck{Allow: false, NeedsConfirm: true, ConfirmReason: a.renderEndAuditConfirmation(work)}
+}
+
+func (a *Agent) renderEndAuditConfirmation(work tools.IncompleteWork) string {
+	files := formatFileReviewList(work.ActiveFiles, 80)
 	return a.render("end_audit_confirmation", map[string]string{"files": strings.Join(files, "\n")})
+}
+
+func (a *Agent) renderEndAuditBlocker(work tools.IncompleteWork, nextSteps string) string {
+	var b strings.Builder
+	b.WriteString("你调用了 end_audit，但当前仍有未闭合的审计工作，不能结束。\n\n")
+	if len(work.Todos) > 0 {
+		b.WriteString("## 未完成 Todo\n")
+		for _, todo := range limitTodos(work.Todos, 20) {
+			b.WriteString(fmt.Sprintf("- #%d [%s/%s] %s\n", todo.ID, todo.Status, todo.Priority, todo.Title))
+		}
+		b.WriteString("\n")
+	}
+	if len(work.Flows) > 0 {
+		b.WriteString("## 未闭合 Flow\n")
+		for _, flow := range limitFlows(work.Flows, 20) {
+			b.WriteString(fmt.Sprintf("- [%s] %s", flow.Status, flow.Name))
+			if flow.NextStep != "" {
+				b.WriteString("，下一步：")
+				b.WriteString(flow.NextStep)
+			}
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	}
+	if len(work.Variables) > 0 {
+		b.WriteString("## 未闭合变量/符号\n")
+		for _, variable := range limitVariables(work.Variables, 20) {
+			b.WriteString(fmt.Sprintf("- [%s] %s", variable.Status, variable.Name))
+			if variable.Path != "" {
+				b.WriteString(" @ ")
+				b.WriteString(variable.Path)
+			}
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	}
+	if len(work.UnknownFiles) > 0 {
+		b.WriteString("## 文件状态异常\n")
+		for _, file := range formatFileReviewList(work.UnknownFiles, 20) {
+			b.WriteString(file)
+			b.WriteString("\n")
+		}
+		b.WriteString("\n")
+	}
+	if summaryContradictsEndAudit(nextSteps) {
+		b.WriteString("## next_steps 与结束状态冲突\n")
+		b.WriteString("- next_steps 里仍包含明确的待执行审计动作。请继续审计，或将 next_steps 改写为非阻塞的后续建议。\n\n")
+	}
+	b.WriteString("请先继续调用 todo_update、flow_review_delete、variable_review_update、file_review_update、read_file 或 search_content 闭合这些工作；只有在 todo、flow、变量都闭合后，才允许用“剩余文件无价值”作为结束理由。")
+	return strings.TrimSpace(b.String())
+}
+
+func decodeEndAuditArgs(raw json.RawMessage) endAuditToolArgs {
+	var args endAuditToolArgs
+	_ = json.Unmarshal(raw, &args)
+	return args
+}
+
+func summaryContradictsEndAudit(nextSteps string) bool {
+	text := strings.TrimSpace(strings.ToLower(nextSteps))
+	if text == "" {
+		return false
+	}
+	markers := []string{
+		"继续审计", "继续检查", "继续读", "继续分析", "继续排查", "继续追踪",
+		"审计 ", "检查 ", "排查 ", "追踪 ",
+		"继续audit", "continue audit", "read_file", "search_content",
+	}
+	for _, marker := range markers {
+		if strings.Contains(text, strings.ToLower(marker)) {
+			return true
+		}
+	}
+	return false
+}
+
+func formatFileReviewList(files []tools.FileReview, limit int) []string {
+	var out []string
+	for i, file := range files {
+		if i >= limit {
+			out = append(out, fmt.Sprintf("- ...还有 %d 个文件未列出", len(files)-limit))
+			break
+		}
+		out = append(out, fmt.Sprintf("- [%s] %s", file.Status, file.Path))
+	}
+	return out
+}
+
+func limitTodos(todos []tools.Todo, limit int) []tools.Todo {
+	if len(todos) <= limit {
+		return todos
+	}
+	return todos[:limit]
+}
+
+func limitFlows(flows []tools.FlowReview, limit int) []tools.FlowReview {
+	if len(flows) <= limit {
+		return flows
+	}
+	return flows[:limit]
+}
+
+func limitVariables(variables []tools.VariableReview, limit int) []tools.VariableReview {
+	if len(variables) <= limit {
+		return variables
+	}
+	return variables[:limit]
 }
 
 func (a *Agent) displayToolResult(name, result string) string {
