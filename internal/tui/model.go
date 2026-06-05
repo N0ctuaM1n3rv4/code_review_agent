@@ -1366,7 +1366,7 @@ func (m Model) renderFooter(width int) string {
 	if menu := renderCommandPalette(m.commandMatches(), m.cmdSelected, width); menu != "" {
 		parts = append(parts, menu)
 	}
-	inputLine := lipgloss.NewStyle().Background(lipgloss.Color("235")).Render(padStyledToWidth("> "+m.input.View(), width))
+	inputLine := lipgloss.NewStyle().Background(lipgloss.Color("235")).Render(padStyledToWidth(m.input.View(), width))
 	statusLine := styleHelp.Render(padToWidth(m.commandHelpLine(), width))
 	parts = append(parts, inputLine, statusLine)
 	return strings.Join(parts, "\n")

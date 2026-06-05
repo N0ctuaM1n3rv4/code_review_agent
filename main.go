@@ -43,7 +43,13 @@ func main() {
 	}
 
 	runner := agent.New(cfg, prompts, client, registry)
-	program := tea.NewProgram(tui.New(runner, cfg, *auditDir), tea.WithAltScreen(), tea.WithMouseCellMotion())
+	program := tea.NewProgram(
+		tui.New(runner, cfg, *auditDir),
+		tea.WithAltScreen(),
+		tea.WithMouseCellMotion(),
+		// Open a dedicated console input handle so Windows IME input is read from CONIN$.
+		tea.WithInputTTY(),
+	)
 	if _, err := program.Run(); err != nil {
 		fmt.Fprintf(os.Stderr, "run tui: %v\n", err)
 		os.Exit(1)
