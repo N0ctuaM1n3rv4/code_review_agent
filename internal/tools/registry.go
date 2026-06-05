@@ -16,8 +16,11 @@ type Registry struct {
 	files              []FileReview
 	variables          []VariableReview
 	flows              []FlowReview
+	tasks              []Task
+	automation         AutomationState
 	audit              AuditState
 	nextTodoID         int
+	nextTaskID         int
 }
 
 type Result struct {
@@ -29,19 +32,22 @@ type Result struct {
 }
 
 type Todo struct {
-	ID       int    `json:"id"`
-	Title    string `json:"title"`
-	Status   string `json:"status"`
-	Priority string `json:"priority"`
+	ID               int    `json:"id"`
+	Title            string `json:"title"`
+	Status           string `json:"status"`
+	Priority         string `json:"priority"`
+	AutomationTaskID int    `json:"automation_task_id,omitempty"`
 }
 
 type Snapshot struct {
-	Todos     []Todo           `json:"todos"`
-	Findings  []Finding        `json:"findings"`
-	Files     []FileReview     `json:"files"`
-	Variables []VariableReview `json:"variables"`
-	Flows     []FlowReview     `json:"flows"`
-	Audit     AuditState       `json:"audit"`
+	Todos      []Todo           `json:"todos"`
+	Findings   []Finding        `json:"findings"`
+	Files      []FileReview     `json:"files"`
+	Variables  []VariableReview `json:"variables"`
+	Flows      []FlowReview     `json:"flows"`
+	Tasks      []Task           `json:"tasks,omitempty"`
+	Automation AutomationState  `json:"automation,omitempty"`
+	Audit      AuditState       `json:"audit"`
 }
 
 type IncompleteWork struct {
@@ -60,12 +66,25 @@ func (r *Registry) RestoreSnapshot(snapshot Snapshot) {
 	r.files = append([]FileReview(nil), snapshot.Files...)
 	r.variables = append([]VariableReview(nil), snapshot.Variables...)
 	r.flows = append([]FlowReview(nil), snapshot.Flows...)
+	r.tasks = append([]Task(nil), snapshot.Tasks...)
+	r.automation = snapshot.Automation
 	r.audit = snapshot.Audit
 	r.nextTodoID = 1
+	r.nextTaskID = 1
 	for _, todo := range r.todos {
 		if todo.ID >= r.nextTodoID {
 			r.nextTodoID = todo.ID + 1
 		}
+	}
+	for _, task := range r.tasks {
+		if task.ID >= r.nextTaskID {
+			r.nextTaskID = task.ID + 1
+		}
+	}
+	if len(r.tasks) == 0 && len(r.todos) == 0 && len(r.findings) == 0 && len(r.variables) == 0 && len(r.flows) == 0 {
+		r.initializeAutomation()
+	} else {
+		r.prepareAutomationTurn()
 	}
 }
 
@@ -104,8 +123,9 @@ func NewRegistry(workspace string, maxToolResultChars int) (*Registry, error) {
 	if err != nil {
 		return nil, err
 	}
-	r := &Registry{workspace: abs, maxToolResultChars: maxToolResultChars, nextTodoID: 1}
+	r := &Registry{workspace: abs, maxToolResultChars: maxToolResultChars, nextTodoID: 1, nextTaskID: 1}
 	r.refreshFileInventory()
+	r.initializeAutomation()
 	return r, nil
 }
 
@@ -120,9 +140,13 @@ func (r *Registry) SetWorkspace(workspace string) error {
 	r.files = nil
 	r.variables = nil
 	r.flows = nil
+	r.tasks = nil
+	r.automation = AutomationState{}
 	r.audit = AuditState{}
 	r.nextTodoID = 1
+	r.nextTaskID = 1
 	r.refreshFileInventory()
+	r.initializeAutomation()
 	return nil
 }
 
@@ -184,6 +208,9 @@ func (r *Registry) Call(name string, raw json.RawMessage) string {
 	if err != nil {
 		return fmt.Sprintf(`{"ok":false,"error":%q}`, err.Error())
 	}
+	if name != "review_state" {
+		r.RecordToolUsage(name, raw, "")
+	}
 	out := string(data)
 	if r.maxToolResultChars > 0 && len(out) > r.maxToolResultChars {
 		out = out[:r.maxToolResultChars] + "\n...truncated..."
@@ -196,7 +223,16 @@ func IsTerminalTool(name string) bool {
 }
 
 func (r *Registry) Snapshot() Snapshot {
-	return Snapshot{Todos: r.Todos(), Findings: r.Findings(), Files: r.Files(), Variables: r.Variables(), Flows: r.Flows(), Audit: r.Audit()}
+	return Snapshot{
+		Todos:      r.Todos(),
+		Findings:   r.Findings(),
+		Files:      r.Files(),
+		Variables:  r.Variables(),
+		Flows:      r.Flows(),
+		Tasks:      r.Tasks(),
+		Automation: r.Automation(),
+		Audit:      r.Audit(),
+	}
 }
 
 func (r *Registry) Audit() AuditState {

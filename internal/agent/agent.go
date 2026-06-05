@@ -44,6 +44,8 @@ type Event struct {
 	Kind         string
 	Content      string
 	Skills       []string
+	Tasks        []tools.Task
+	Automation   tools.AutomationState
 	VerifyTitle  string
 	VerifyTurn   int
 	VerifyLimit  int
@@ -98,6 +100,7 @@ func (a *Agent) systemPrompt() string {
 	system := a.prompts.SystemWithSkills()
 	system += "\n\n" + a.tools.GitPrompt()
 	system += "\n\n" + a.tools.ToolPrompt()
+	system += "\n\n" + a.tools.AutomationPrompt(10)
 	system += "\n\n" + a.skillToolPrompt()
 	if a.cfg.Agent.AutoPlan {
 		system += "\n\n" + a.render("auto_plan", nil)
@@ -151,6 +154,7 @@ func (a *Agent) LoadedSkills() []string {
 }
 
 func (a *Agent) Run(ctx context.Context, input string, emit func(Event)) {
+	a.tools.PrepareAutomationTurn()
 	a.initialUserMsg = a.render("initial_audit_instruction", map[string]string{"input": input, "review_state": a.tools.ReviewPrompt(160)})
 	a.compressUserMsgs = nil
 	a.trajectory = trajectory.New(
@@ -246,7 +250,9 @@ func (a *Agent) callTool(ctx context.Context, emit func(Event), call ToolCall) s
 		return a.loadSkill(call.Arguments)
 	}
 	if call.Name == "verify_finding" {
-		return a.verifyFinding(ctx, emit, call.Arguments)
+		result := a.verifyFinding(ctx, emit, call.Arguments)
+		a.tools.RecordToolUsage(call.Name, call.Arguments, result)
+		return result
 	}
 	return a.tools.Call(call.Name, call.Arguments)
 }
@@ -658,7 +664,18 @@ func formatEndAuditResult(result string) string {
 
 func (a *Agent) emitState(emit func(Event)) {
 	snapshot := a.tools.Snapshot()
-	emit(Event{Kind: "state", Skills: a.prompts.LoadedSkillNames(), Todos: snapshot.Todos, Findings: snapshot.Findings, Files: snapshot.Files, Variables: snapshot.Variables, Flows: snapshot.Flows, Audit: snapshot.Audit})
+	emit(Event{
+		Kind:       "state",
+		Skills:     a.prompts.LoadedSkillNames(),
+		Tasks:      snapshot.Tasks,
+		Automation: snapshot.Automation,
+		Todos:      snapshot.Todos,
+		Findings:   snapshot.Findings,
+		Files:      snapshot.Files,
+		Variables:  snapshot.Variables,
+		Flows:      snapshot.Flows,
+		Audit:      snapshot.Audit,
+	})
 }
 
 func (a *Agent) formatFinalFindings() string {

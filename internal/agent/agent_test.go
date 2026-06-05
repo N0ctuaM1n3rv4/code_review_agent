@@ -79,6 +79,8 @@ func TestEndAuditCheckBlocksTrackingFlow(t *testing.T) {
 func TestEndAuditCheckRequiresSecondConfirmationForFilesOnly(t *testing.T) {
 	agent := newTestAgent(t)
 	agent.tools.RestoreSnapshot(tools.Snapshot{
+		Todos: []tools.Todo{{ID: 1, Title: "背景已完成", Status: "completed", Priority: "high", AutomationTaskID: 1}},
+		Tasks: []tools.Task{{ID: 1, Type: "repo_context", Title: "背景已完成", Priority: "high", Status: "done", TodoID: 1}},
 		Files: []tools.FileReview{
 			{Path: "main.go", Status: "reviewed"},
 			{Path: "README.md", Status: "unseen"},

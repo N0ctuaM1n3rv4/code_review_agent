@@ -72,6 +72,8 @@ func (r *Registry) todoCreate(raw json.RawMessage) Result {
 	todo := Todo{ID: r.nextTodoID, Title: args.Title, Status: "pending", Priority: args.Priority}
 	r.nextTodoID++
 	r.todos = append(r.todos, todo)
+	r.createAutomationTask(taskTypeManualFollowup, args.Title, args.Priority, nil, 0, false)
+	r.syncAutomationAfterMutation()
 	return Result{OK: true, Data: r.todos, Message: "todo created"}
 }
 
@@ -93,6 +95,7 @@ func (r *Registry) todoUpdate(raw json.RawMessage) Result {
 		if args.Priority != "" {
 			r.todos[i].Priority = args.Priority
 		}
+		r.syncAutomationAfterMutation()
 		return Result{OK: true, Data: r.todos, Message: "todo updated"}
 	}
 	return Result{OK: false, Error: "todo not found"}

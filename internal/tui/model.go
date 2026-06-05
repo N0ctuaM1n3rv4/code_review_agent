@@ -40,6 +40,8 @@ type Model struct {
 	scroll         int
 	sideScroll     int
 	todos          []tools.Todo
+	tasks          []tools.Task
+	automation     tools.AutomationState
 	findings       []tools.Finding
 	files          []tools.FileReview
 	filesExpanded  bool
@@ -701,17 +703,21 @@ func (m Model) cancelAudit() (tea.Model, tea.Cmd) {
 func (m Model) exportReport() (tea.Model, tea.Cmd) {
 	filesReviewed, filesUnreviewed := splitFilesForReport(m.files)
 	report := struct {
-		GeneratedAt string                   `json:"generated_at"`
-		Audit       tools.AuditState         `json:"audit"`
-		Count       int                      `json:"count"`
-		Findings    []tools.Finding          `json:"findings"`
-		Todos       []tools.Todo             `json:"todos"`
-		Files       reportFiles              `json:"files"`
-		Variables   []tools.VariableReview   `json:"variables"`
-		Flows       []tools.FlowReview       `json:"flows"`
-		Trajectory  *trajectory.Trajectory   `json:"trajectory,omitempty"`
+		GeneratedAt string                 `json:"generated_at"`
+		Automation  tools.AutomationState  `json:"automation,omitempty"`
+		Tasks       []tools.Task           `json:"tasks,omitempty"`
+		Audit       tools.AuditState       `json:"audit"`
+		Count       int                    `json:"count"`
+		Findings    []tools.Finding        `json:"findings"`
+		Todos       []tools.Todo           `json:"todos"`
+		Files       reportFiles            `json:"files"`
+		Variables   []tools.VariableReview `json:"variables"`
+		Flows       []tools.FlowReview     `json:"flows"`
+		Trajectory  *trajectory.Trajectory `json:"trajectory,omitempty"`
 	}{
 		GeneratedAt: time.Now().Format(time.RFC3339),
+		Automation:  m.automation,
+		Tasks:       m.tasks,
 		Audit:       m.audit,
 		Count:       len(m.findings),
 		Findings:    m.findings,
@@ -846,6 +852,8 @@ func (m Model) restoreSession(path string) (tea.Model, tea.Cmd) {
 	m.sessionPath = path
 	snapshot := m.runner.Snapshot()
 	m.todos = snapshot.Todos
+	m.tasks = snapshot.Tasks
+	m.automation = snapshot.Automation
 	m.findings = snapshot.Findings
 	m.files = snapshot.Files
 	m.variables = snapshot.Variables
@@ -953,6 +961,8 @@ func (m *Model) appendEvent(e agent.Event) {
 			m.verifyLimit = e.VerifyLimit
 			m.verifyStatus = e.VerifyStatus
 		}
+		m.tasks = e.Tasks
+		m.automation = e.Automation
 		m.todos = e.Todos
 		m.findings = e.Findings
 		m.files = e.Files
@@ -1227,7 +1237,7 @@ func (m Model) View() string {
 		footer := m.renderFooter(m.width)
 		return lipgloss.JoinVertical(lipgloss.Left, top, "", footer)
 	}
-	left := renderSidebar(m.loadedSkills, m.todos, m.findings, m.files, m.filesExpanded, m.variables, m.flows, sideWidth, topHeight, m.sideScroll, m.pane == "side", m.petContext())
+	left := renderSidebar(m.loadedSkills, m.automation, m.tasks, m.todos, m.findings, m.files, m.filesExpanded, m.variables, m.flows, sideWidth, topHeight, m.sideScroll, m.pane == "side", m.petContext())
 	top := renderColumns(left, main, sideWidth, contentWidth, topHeight)
 	footer := m.renderFooter(m.width)
 	return lipgloss.JoinVertical(lipgloss.Left, top, "", footer)
@@ -1444,7 +1454,7 @@ func (m Model) maxScroll() int {
 func (m Model) maxSidebarScroll() int {
 	sideWidth, _ := m.panelWidths()
 	contentWidth := sidebarInnerWidth(sideWidth)
-	lines := sidebarLines(m.loadedSkills, m.todos, m.findings, m.files, m.filesExpanded, m.variables, m.flows, contentWidth)
+	lines := sidebarLines(m.loadedSkills, m.automation, m.tasks, m.todos, m.findings, m.files, m.filesExpanded, m.variables, m.flows, contentWidth)
 	listHeight := sidebarContentHeight(m.topPaneHeight()) - len(renderPetAreaLines(m.petContext(), contentWidth))
 	maxScroll := len(lines) - max(1, listHeight)
 	if maxScroll < 0 {
@@ -1454,7 +1464,7 @@ func (m Model) maxSidebarScroll() int {
 }
 
 func (m Model) visibleSidebarLines(contentWidth int) []string {
-	lines := sidebarLines(m.loadedSkills, m.todos, m.findings, m.files, m.filesExpanded, m.variables, m.flows, contentWidth)
+	lines := sidebarLines(m.loadedSkills, m.automation, m.tasks, m.todos, m.findings, m.files, m.filesExpanded, m.variables, m.flows, contentWidth)
 	contentHeight := max(1, sidebarContentHeight(m.topPaneHeight())-len(renderPetAreaLines(m.petContext(), contentWidth)))
 	if len(lines) > contentHeight {
 		start := min(m.sideScroll, len(lines)-contentHeight)
@@ -1702,7 +1712,7 @@ func findToolCallJSONObject(text string) (string, bool) {
 	return "", false
 }
 
-func renderSidebar(skills []string, todos []tools.Todo, findings []tools.Finding, files []tools.FileReview, filesExpanded bool, variables []tools.VariableReview, flows []tools.FlowReview, width, height, scroll int, focused bool, pet petRenderContext) string {
+func renderSidebar(skills []string, automation tools.AutomationState, tasks []tools.Task, todos []tools.Todo, findings []tools.Finding, files []tools.FileReview, filesExpanded bool, variables []tools.VariableReview, flows []tools.FlowReview, width, height, scroll int, focused bool, pet petRenderContext) string {
 	if width <= 0 {
 		return ""
 	}
@@ -1710,7 +1720,7 @@ func renderSidebar(skills []string, todos []tools.Todo, findings []tools.Finding
 	contentHeight := sidebarContentHeight(height)
 	petLines := renderPetAreaLines(pet, contentWidth)
 	listHeight := max(1, contentHeight-len(petLines))
-	lines := sidebarLines(skills, todos, findings, files, filesExpanded, variables, flows, contentWidth)
+	lines := sidebarLines(skills, automation, tasks, todos, findings, files, filesExpanded, variables, flows, contentWidth)
 	if len(lines) > listHeight {
 		start := min(max(0, scroll), len(lines)-listHeight)
 		end := start + listHeight
@@ -1993,7 +2003,7 @@ func centerPetBlock(lines []string, width int) []string {
 	return out
 }
 
-func sidebarLines(skills []string, todos []tools.Todo, findings []tools.Finding, files []tools.FileReview, filesExpanded bool, variables []tools.VariableReview, flows []tools.FlowReview, width int) []string {
+func sidebarLines(skills []string, automation tools.AutomationState, tasks []tools.Task, todos []tools.Todo, findings []tools.Finding, files []tools.FileReview, filesExpanded bool, variables []tools.VariableReview, flows []tools.FlowReview, width int) []string {
 	var lines []string
 	appendLine := func(text string) {
 		lines = append(lines, renderSidebarLine(lipgloss.NewStyle(), text, width))
@@ -2012,6 +2022,29 @@ func sidebarLines(skills []string, todos []tools.Todo, findings []tools.Finding,
 	} else {
 		for _, skill := range skills {
 			appendWrapped(styleSuccess, skill)
+		}
+	}
+	appendLine("")
+
+	appendStyledLine(styleSidebarTitle, "自动化")
+	if strings.TrimSpace(automation.Stage) == "" {
+		appendStyledLine(styleMuted, "暂无自动化状态")
+	} else {
+		appendWrapped(styleSuccess, "阶段: "+automation.Stage)
+		if automation.CurrentTaskID > 0 {
+			appendWrapped(styleMuted, fmt.Sprintf("当前任务 #%d: %s", automation.CurrentTaskID, automation.CurrentTaskTitle))
+		}
+		if automation.LastDispatchReason != "" {
+			appendWrapped(styleMuted, automation.LastDispatchReason)
+		}
+	}
+	if len(tasks) > 0 {
+		for i, task := range tasks {
+			if i >= 4 {
+				appendStyledLine(styleMuted, fmt.Sprintf("...还有 %d 个自动化任务", len(tasks)-4))
+				break
+			}
+			appendWrapped(statusStyle(task.Status), fmt.Sprintf("[%s/%s] %s", task.Type, task.Status, task.Title))
 		}
 	}
 	appendLine("")
